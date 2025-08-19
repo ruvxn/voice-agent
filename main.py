@@ -1,3 +1,27 @@
+"""
+Twilio <Stream>  <->  Your WebSocket server  <->  Deepgram Agent WebSocket
+
+Goal
+----
+Bridge live caller audio from Twilio to Deepgram (STT/agent) and pipe the
+agent's *audio responses* back to Twilio in real time. We also listen for
+Deepgram's *text events* (JSON) to do control actions like barge-in.
+
+Architecture (high level)
+-------------------------
+Twilio <Stream> opens a WS to *this* server (ws://localhost:5000).
+This server, per incoming Twilio connection, opens a *second* WS to
+wss://agent.deepgram.com/v1/agent/converse and then shuttles data:
+
+- Caller -> Twilio "media" frames (base64 mu-law) -> decode -> bytes.
+- Buffer to ~400 ms chunks -> forward raw mu-law bytes to Deepgram.
+- Deepgram sends back:
+    * JSON text messages (events, transcripts, etc.) -> we inspect/act.
+    * Binary audio (mu-law PCM) -> base64 -> Twilio "media" outbound.
+
+We keep track of Twilio's streamSid so replies are routed to the right call.
+"""
+
 import asyncio
 import base64
 import json
@@ -11,6 +35,19 @@ load_dotenv()
 
 # ---- Deepgram Agent WS ------------------------------------------------------
 def sts_connect():
+    """
+    Create a TLS-verified WebSocket *client* connection to Deepgram Agent.
+
+    Why certifi?
+      - Ensures we validate Deepgram's TLS certificate even inside some venvs
+        that don't have a proper CA bundle.
+
+    Why disable ping/pong here?
+      - Twilio and Deepgram both maintain their own heartbeat behavior.
+        We set ping_interval/ping_timeout=None to avoid *our* library
+        interfering or closing otherwise-healthy long-lived streams.
+    """
+
     api_key = os.getenv("DEEPGRAM_API_KEY")
     if not api_key:
         raise Exception("DEEPGRAM_API_KEY is not found")
@@ -25,6 +62,14 @@ def sts_connect():
     )
 
 def load_config():
+    """
+    Load the JSON agent configuration that we send as the FIRST message to Deepgram.
+
+    - Deepgram requires a configuration JSON (e.g., audio format, agent system prompt,
+      tools/functions, etc.) right after the WS opens.
+    - We read config.json from the script directory for portability.
+    - We validate it's non-empty and valid JSON so failures are explicit/early.
+    """
     path = os.path.join(os.path.dirname(__file__), "config.json")
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read().strip()
@@ -37,16 +82,41 @@ def load_config():
 
 
 # ---- Helpers ----------------------------------------------------------------
+"""
+    When Deepgram tells us the user started speaking (barge-in),
+    we send Twilio a 'clear' command to stop any audio currently playing
+    (e.g., interrupting the assistant's TTS playback).
+    """
+
 async def handle_barge_in(decoded, twilio_ws, streamsid):
     if decoded.get("type") == "UserStartedSpeaking":
         await twilio_ws.send(json.dumps({"event": "clear", "streamSid": streamsid}))
 
 async def handle_text_message(decoded, twilio_ws, sts_ws, streamsid):
+    """
+    Handle Deepgram JSON messages (non-audio).
+
+    Extend this with:
+      - logging transcripts
+      - reacting to tool-calls
+      - switching agent state, etc.
+    """
     # Add more message types here if you want (assistant responses, logs, etc.)
     await handle_barge_in(decoded, twilio_ws, streamsid)
 
 # ---- Tasks ------------------------------------------------------------------
 async def sts_sender(sts_ws, audio_queue):
+    """
+    Pump caller audio *to* Deepgram.
+
+    Data path:
+      Twilio media (inbound track, base64 mu-law) --> bytes
+      -> buffered to ~400 ms chunks -> queued -> here we .send(raw bytes)
+
+    Why raw mu-law?
+      - Deepgram's Agent endpoint accepts mu-law 8k payload when configured that way.
+      - That avoids transcoding on your side and reduces latency.
+    """
     print("sts_sender started")
     while True:
         chunk = await audio_queue.get()
@@ -57,6 +127,15 @@ async def sts_sender(sts_ws, audio_queue):
             break
 
 async def sts_receiver(sts_ws, twilio_ws, streamsid_queue):
+    """
+    Receive *both* JSON (text control) and binary (agent audio) from Deepgram.
+
+    - JSON str  -> parse -> handle_text_message(...)
+    - Binary    -> base64 -> send as Twilio 'media' event (outbound audio)
+
+    We must wait for Twilio's streamSid before emitting media back to Twilio,
+    so we await it from streamsid_queue at the start.
+    """
     print("sts_receiver started")
     streamsid = await streamsid_queue.get()
     print("sts_receiver got streamsid:", streamsid)
@@ -82,6 +161,20 @@ async def sts_receiver(sts_ws, twilio_ws, streamsid_queue):
             break
 
 async def twilio_receiver(twilio_ws, audio_queue, streamsid_queue):
+    """
+    Receive Twilio <Stream> events and caller audio.
+
+    Twilio WS messages:
+      - "start": includes {"start": {"streamSid": "..."}}
+      - "media": inbound audio frames (base64 mu-law, 20 ms per frame)
+      - "stop": end of stream
+
+    We:
+      1) Capture streamSid and publish it so sts_receiver can reply.
+      2) Accumulate inbound mu-law in a buffer and ship to Deepgram in ~400 ms
+         chunks (20 frames * 20 ms * 20 = 400 ms). This strikes a balance
+         between latency and throughput; tune if needed.
+    """
     print("twilio_receiver started")
     BUFFER_SIZE = 20 * 160  # 20 x 20ms muLaw frames = 400ms
     inbuffer = bytearray()
@@ -115,6 +208,18 @@ async def twilio_receiver(twilio_ws, audio_queue, streamsid_queue):
             break
 
 async def twilio_handler(twilio_ws):
+    """
+    Handle a single Twilio <Stream> WebSocket connection.
+
+    For each inbound call stream:
+      - Open a *fresh* connection to Deepgram.
+      - Immediately send the agent config to Deepgram (required).
+      - Run three tasks concurrently:
+          1) sts_sender:    caller audio -> Deepgram
+          2) sts_receiver:  Deepgram -> agent audio JSON/binary -> Twilio
+          3) twilio_receiver: Twilio events/media -> queues
+      - If any task fails (FIRST_EXCEPTION), cancel the others and close.
+    """
     audio_queue = asyncio.Queue()
     streamsid_queue = asyncio.Queue()
 
@@ -134,6 +239,12 @@ async def twilio_handler(twilio_ws):
 
 # IMPORTANT: accept the /twilio path your TwiML points at
 async def main():
+    """
+    Start a local WS server that Twilio <Stream> will connect to.
+
+    Twilio console / TwiML must point <Stream url="wss://..."> to this server.
+    In dev, Twilio expects a public URL (use ngrok/cloudflared to expose :5000).
+    """
     async def handler_router(ws, path=None):
         # Some websockets versions pass only (ws); others pass (ws, path)
         await twilio_handler(ws)
